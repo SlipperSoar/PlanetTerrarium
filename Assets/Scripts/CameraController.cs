@@ -44,6 +44,17 @@ public class CameraController : MonoBehaviour
     /// <summary>当前状态（Idle / Dragging / Transitioning），供 UI 与测试读取。</summary>
     public CameraOrbitState.Phase OrbitPhase => orbit.State;
 
+    /// <summary>
+    /// 外部接管（地表巡回模式）。为 true 时 <see cref="LateUpdate"/> 不再写 Transform，
+    /// 由 SurfaceRover 全权控制相机；关闭后环绕逻辑从当前位置继续。
+    /// </summary>
+    public bool ExternalControl { get; private set; }
+
+    public void SetExternalControl(bool external)
+    {
+        ExternalControl = external;
+    }
+
     #endregion
 
     #region Unity
@@ -73,7 +84,7 @@ public class CameraController : MonoBehaviour
 
     void LateUpdate()
     {
-        if (target == null)
+        if (target == null || ExternalControl)
             return;
 
         HandleScrollWheel();

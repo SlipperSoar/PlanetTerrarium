@@ -81,6 +81,7 @@
             <ui:Button name="equator-button" text="赤道" class="view-button" />
             <ui:Button name="south-button" text="南极" class="view-button" />
             <ui:Button name="top-button" text="俯视" class="view-button" />
+            <ui:Button name="surface-rover-button" text="地表巡回" class="view-button" />
             <ui:VisualElement name="status-panel">
                 <ui:VisualElement class="status-row">
                     <ui:Label text="旋转" class="status-label" />

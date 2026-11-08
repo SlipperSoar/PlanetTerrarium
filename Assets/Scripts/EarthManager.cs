@@ -275,6 +275,36 @@ public class EarthManager : MonoBehaviour
         earthRenderer != null ? earthRenderer.bounds.extents.x : 0f;
 
     /// <summary>
+    /// 星球**自身网格**的世界半径（不含任何子物体 / 球壳）。
+    /// 与 <see cref="AtmosphereGlow"/> / <see cref="CloudLayer"/> 的 ApplyScale 算法一致：
+    /// 用 <c>Mesh.bounds</c> × <c>lossyScale</c>。地表巡回模式据此把相机放在地表之上，
+    /// 用 PlanetWorldRadius 万一被别的 Renderer 影响会偏大，这里更可靠。
+    /// </summary>
+    public float PlanetSurfaceRadius
+    {
+        get
+        {
+            if (earthRenderer == null)
+                return 1f;
+            MeshFilter mf = earthRenderer.GetComponent<MeshFilter>();
+            if (mf != null && mf.sharedMesh != null)
+            {
+                Bounds b = mf.sharedMesh.bounds;
+                float meshR = Mathf.Max(b.extents.x, Mathf.Max(b.extents.y, b.extents.z));
+                Vector3 s = earthRenderer.transform.lossyScale;
+                float maxS = Mathf.Max(Mathf.Abs(s.x), Mathf.Max(Mathf.Abs(s.y), Mathf.Abs(s.z)));
+                if (meshR > 1e-5f)
+                    return meshR * maxS;
+            }
+            return PlanetWorldRadius > 1e-4f ? PlanetWorldRadius : 1f;
+        }
+    }
+
+    /// <summary>星球中心（世界空间）。地表巡回模式据此定位相机。</summary>
+    public Vector3 PlanetCenter =>
+        earthRenderer != null ? earthRenderer.transform.position : transform.position;
+
+    /// <summary>
     /// 设置星球半径（km），按地球半径为 1.0 倍缩放星球本身。
     ///
     /// 只改 <c>earthRenderer</c> 的 localScale：

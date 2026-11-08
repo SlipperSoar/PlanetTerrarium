@@ -25,15 +25,34 @@ public class AtmosphereGlow : MonoBehaviour
     [Tooltip("大气层高出地表的厚度（星球半径的倍数）。必须大于云层的 0.12，才能套在云层外")]
     private float shellThickness = 0.16f;
 
-    [Header("辉光")]
+    [Header("散射（步骤 3）")]
+    [SerializeField] private Color scatterColor = new Color(0.35f, 0.62f, 1.0f, 1f);
+    [SerializeField, Range(0.01f, 4f)] private float density = 0.65f;
+    [SerializeField, Range(0.2f, 20f)]
+    [Tooltip("散射整体强度。标定：3.0 时球内(地表巡回)可见、球外不过曝")]
+    private float scatterScale = 3.0f;
+    [SerializeField, Range(4, 32)] private int raySteps = 12;
+    [SerializeField, Range(0f, 4f)] private float sunIntensity = 1.6f;
+    [SerializeField, Range(0f, 2f)] private float rayleigh = 1.0f;
+    [SerializeField, Range(0f, 2f)] private float mie = 0.25f;
+    [SerializeField, Range(0.1f, 4f)] private float exposure = 1.0f;
+    [SerializeField, Tooltip("是否用场景深度遮挡大气（需相机开 DepthTextureMode.Depth）")] private bool useDepthOcclusion = true;
+
+    [Header("边缘辉光（V3.2 保留）")]
     [SerializeField] private Color glowColor = new Color(0.45f, 0.72f, 1.0f, 1f);
     [SerializeField, Range(0.5f, 8f)] private float edgeFalloff = 2.2f;
-    [SerializeField, Range(0f, 3f)] private float glowStrength = 1.1f;
-    [SerializeField, Range(0f, 2f)] private float sunBoost = 0.6f;
-    [SerializeField, Tooltip("启动时是否显示大气辉光")] private bool startVisible = true;
+    [SerializeField, Range(0f, 3f)] private float glowStrength = 0.5f;
+
+    [SerializeField, Tooltip("启动时是否显示大气")] private bool startVisible = true;
 
     private GameObject _sphereObject;
     private Material _material;
+    private Camera _mainCamera;
+    private bool _depthWasEnabled;
+
+    // 最近一次算出的球壳半径（世界空间），供每帧写 uniform
+    private float _innerRadius = 1f;
+    private float _outerRadius = 1.16f;
 
     public bool IsVisible => _sphereObject != null && _sphereObject.activeSelf;
 
@@ -49,6 +68,50 @@ public class AtmosphereGlow : MonoBehaviour
     {
         // 启动时就建好并按 startVisible 显隐，保证画面与开关一致
         SetVisible(startVisible);
+        SetupDepthTexture();
+    }
+
+    private void Update()
+    {
+        // 每帧把球壳参数写进材质：星球可能被缩放、相机可能进入球内（巡回模式），
+        // 这些 uniform 必须实时更新，否则 raymarch 的积分起点会错位。
+        if (_material == null || !IsVisible)
+            return;
+
+        // 深度纹理可能因相机切换 / 时序未在 Start 时就绪，这里每帧兜底确认。
+        if (useDepthOcclusion)
+        {
+            if (_mainCamera == null)
+                _mainCamera = Camera.main;
+            if (_mainCamera != null && (_mainCamera.depthTextureMode & DepthTextureMode.Depth) == 0)
+                _mainCamera.depthTextureMode |= DepthTextureMode.Depth;
+        }
+
+        Vector3 center = earthRenderer != null
+            ? earthRenderer.transform.position
+            : transform.position;
+
+        _material.SetVector("_AtmoSphere", new Vector4(center.x, center.y, center.z, _outerRadius));
+        _material.SetFloat("_AtmoInnerRadius", _innerRadius);
+        _material.SetFloat("_AtmoThickness", Mathf.Max(1e-4f, _outerRadius - _innerRadius));
+
+        if (useDepthOcclusion)
+            _material.EnableKeyword("_ATMOSPHERE_DEPTH_ON");
+        else
+            _material.DisableKeyword("_ATMOSPHERE_DEPTH_ON");
+    }
+
+    /// <summary>给主相机开深度纹理，供大气 shader 做深度遮挡。</summary>
+    private void SetupDepthTexture()
+    {
+        if (!useDepthOcclusion)
+            return;
+        _mainCamera = Camera.main;
+        if (_mainCamera == null)
+            return;
+        _depthWasEnabled = (_mainCamera.depthTextureMode & DepthTextureMode.Depth) != 0;
+        if (!_depthWasEnabled)
+            _mainCamera.depthTextureMode |= DepthTextureMode.Depth;
     }
 
     #endregion
@@ -124,10 +187,7 @@ public class AtmosphereGlow : MonoBehaviour
             Destroy(collider);
 
         _material = new Material(shader);
-        _material.SetColor("_FresnelColor", glowColor);
-        _material.SetFloat("_FresnelPower", edgeFalloff);
-        _material.SetFloat("_FresnelStrength", glowStrength);
-        _material.SetFloat("_SunInfluence", sunBoost);
+        ApplyMaterialParams();
 
         Renderer r = _sphereObject.GetComponent<Renderer>();
         r.material = _material;
@@ -156,10 +216,11 @@ public class AtmosphereGlow : MonoBehaviour
         if (parentScale <= 1e-6f) parentScale = 1f;
 
         float thickness = Mathf.Max(0.13f, shellThickness);   // 保证大于云层 0.12
-        float desiredWorldRadius = earthWorldRadius * (1f + thickness);
+        _innerRadius = earthWorldRadius;                        // 星球表面 = 大气内壳
+        _outerRadius = earthWorldRadius * (1f + thickness);    // 球壳 = 大气外壳
 
         // 图元球网格半径 0.5（直径 1），世界半径 R 需要 2R / parentScale
-        float localScale = 2f * desiredWorldRadius / parentScale;
+        float localScale = 2f * _outerRadius / parentScale;
         _sphereObject.transform.localScale = new Vector3(localScale, localScale, localScale);
     }
 
@@ -188,20 +249,36 @@ public class AtmosphereGlow : MonoBehaviour
         return r > 1e-4f ? r : 1f;
     }
 
-    private void OnValidate()
+    /// <summary>把 Inspector 参数同步到材质（建壳时与 OnValidate 都调用）。</summary>
+    private void ApplyMaterialParams()
     {
         if (_material == null)
             return;
+        _material.SetColor("_ScatterColor", scatterColor);
+        _material.SetFloat("_Density", density);
+        _material.SetFloat("_ScatterScale", scatterScale);
+        _material.SetInt("_RaySteps", raySteps);
+        _material.SetFloat("_SunIntensity", sunIntensity);
+        _material.SetFloat("_Rayleigh", rayleigh);
+        _material.SetFloat("_Mie", mie);
+        _material.SetFloat("_Exposure", exposure);
         _material.SetColor("_FresnelColor", glowColor);
         _material.SetFloat("_FresnelPower", edgeFalloff);
         _material.SetFloat("_FresnelStrength", glowStrength);
-        _material.SetFloat("_SunInfluence", sunBoost);
+    }
+
+    private void OnValidate()
+    {
+        ApplyMaterialParams();
     }
 
     private void OnDestroy()
     {
         if (_material != null)
             Destroy(_material);
+        // 恢复相机深度纹理设置（只在本次是我们打开的情况下）
+        if (_mainCamera != null && !_depthWasEnabled)
+            _mainCamera.depthTextureMode &= ~DepthTextureMode.Depth;
     }
 
     #endregion

@@ -61,6 +61,8 @@ public class UIController : MonoBehaviour
     private Button _equatorButton;
     private Button _southButton;
     private Button _topButton;
+    private Button _surfaceRoverButton;
+    private SurfaceRover _surfaceRover;
     private Label _rotationValue;
     private Label _timeStatus;
     private Label _seasonStatus;
@@ -250,6 +252,7 @@ public class UIController : MonoBehaviour
         _equatorButton = _root.Q<Button>("equator-button");
         _southButton = _root.Q<Button>("south-button");
         _topButton = _root.Q<Button>("top-button");
+        _surfaceRoverButton = _root.Q<Button>("surface-rover-button");
         _rotationValue = _root.Q<Label>("rotation-value");
         _timeStatus = _root.Q<Label>("time-status");
         _seasonStatus = _root.Q<Label>("season-status");
@@ -1052,12 +1055,45 @@ public class UIController : MonoBehaviour
         _equatorButton.clicked += OnEquatorButtonClick;
         _southButton.clicked += OnSouthPoleButtonClick;
         _topButton.clicked += OnTopButtonClick;
+
+        if (_surfaceRoverButton != null)
+            _surfaceRoverButton.clicked += OnSurfaceRoverButtonClick;
     }
 
     private void OnEquatorButtonClick() => cameraController.SetEquatorView();
     private void OnNorthPoleButtonClick() => cameraController.SetNorthPoleView();
     private void OnSouthPoleButtonClick() => cameraController.SetSouthPoleView();
     private void OnTopButtonClick() => cameraController.SetTopDownView();
+
+    /// <summary>
+    /// 「地表巡回」：把相机放进星球内部贴地表漫游，查看大气散射在球内的表现。
+    /// 首次点击时在主相机上创建 SurfaceRover（不改场景文件）。
+    /// </summary>
+    private void OnSurfaceRoverButtonClick()
+    {
+        if (_surfaceRover == null)
+        {
+            Camera cam = cameraController != null
+                ? cameraController.GetComponent<Camera>()
+                : Camera.main;
+            if (cam == null)
+            {
+                Debug.LogWarning("UIController: 找不到主相机，无法进入地表巡回");
+                return;
+            }
+            _surfaceRover = cam.GetComponent<SurfaceRover>();
+            if (_surfaceRover == null)
+                _surfaceRover = cam.gameObject.AddComponent<SurfaceRover>();
+        }
+
+        _surfaceRover.Toggle();
+        if (_surfaceRoverButton != null)
+            _surfaceRoverButton.text = _surfaceRover.IsActive ? "退出巡回" : "地表巡回";
+        if (_genProgress != null)
+            _genProgress.text = _surfaceRover.IsActive
+                ? "地表巡回：WASD 移动 / 右键转视线 / 滚轮调高度 / Shift 加速"
+                : "已恢复环绕视角";
+    }
 
     #endregion
 

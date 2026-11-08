@@ -1782,6 +1782,103 @@ Properties、两个 pass 的 uniform/helper、ForwardBase frag 里的辉光计�
 
 ---
 
+## 23. V3.4.0：大气单次散射 + 地表巡回（步骤 3）
+
+### 23.1 范围
+
+按用户决策：先只做「散射 + 深度遮挡」，一口气做完大气；步骤 4（cube-sphere LOD）
+改动太大暂不做；旧 Release 不动。新增**地表巡回模式**：把相机放到**星球表面之上、
+大气球壳之内**贴地表漫游，因为大气散射在「大气层内」与「大气层外」的积分路径不同，
+需要一个能"站在地表抬头看天"的视角。
+
+### 23.2 大气散射（升级现有球壳，不新增层）
+
+`AtmosphereGlowShader` 从 V3.2 的纯 Fresnel 光环升级为**球壳单次散射 raymarch**，
+`AtmosphereGlow.cs` 的球壳管理（自动创建 / 缩放 / 跟随星球大小 / 开关 API）全部复用，
+球壳数量不变（地表 / 板块 / 云层 / 大气 = 现有 4 个 Renderer）。
+
+| 项 | 实现 |
+|---|---|
+| `Cull Off` | **关键**：相机在球外时只画正面即可，但地表巡回让相机进入大气球壳内部，`Cull Back` 会让球壳整个消失。两面都画，由 raymarch 显式求射线与球壳交点区间 |
+| 积分区间 | `RaySphere` 求相机射线与外壳交点；相机在球内时 `tEnter = max(0, near) = 0`（从相机起），`tExit = far`。内壳（星球）与场景深度把 `tExit` 钳住 |
+| 密度 / 相位 | 指数密度 `exp(-(1-h01)*4*density)`；瑞利 `0.75(1+cos²θ)` + 米氏（Henyey-Greenstein g=0.76）相位 |
+| 太阳方向 | 每步朝 `_WorldSpaceLightPos0` 再求一次球壳交点算光学厚度 → 单次散射透射率；随 `SunLightController` 的昼夜/季节自然变化 |
+| 深度遮挡 | `SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, screenUV)` → `LinearEyeDepth` → 换算视线方向世界距离，钳积分终点；由 `AtmosphereGlow.SetupDepthTexture()` 给主相机开 `DepthTextureMode.Depth`，`_ATMOSPHERE_DEPTH_ON` keyword 控制 |
+| Fresnel | V3.2 的边缘辉光保留为 `_FresnelStrength` 项（默认 0.5），法线取 `abs(dot(N,V))` 兼容内外两面 |
+| 参数 | 散射色 / 密度 / 步数(4-32) / 太阳强度 / 瑞利 / 米氏 / 曝光挂 `AtmosphereGlow` 组件，`Update` 每帧写 `_AtmoSphere`(球心+外半径) / `_AtmoInnerRadius` / `_AtmoThickness` |
+
+> 「半分辨率」用**降 raymarch 步数**（默认 12）近似，未做离屏半分辨率 RT + 合成；
+> 这是按「先只做散射和遮挡」的决策，成本更低。性能不够时再升级。
+
+**散射标定修正（第三轮实测反馈：巡回时看不出散射）**。用
+`diag_scatter.py` / `sweep_scatter.py` 复算公式，查出三个叠加问题：
+
+1. **密度写反**：`DensityAt(h01) = exp(-(1-h01)*4*density)` 让 `h01=0`（地表）密度
+   最小、`h01=1`（外壳顶）最大，与物理相反。球内抬头看天路径本来就短，
+   贴地表密度还最低 → 散射几乎为零。改为 `exp(-h01*4*density)`（地表最密）
+2. **过度归一化**：末行 `scatter = 1-exp(-scatter*density/outerR)` 把光学深度除以
+   星球半径 2.32，球内路径 0.26 被压到 **0.02~0.07（2~7% 亮度）**，球外穿过整条
+   弦却有 0.70~0.92。改为 Beer-Lambert `tau = (光学深度+sunLit*0.5)*Phase*Sun*Scale`
+   加软压缩 `tau/(1+tau)`：长路径平滑趋向 1 不死白、短路径保留可见梯度
+3. **新增 `_ScatterScale`**（默认 **3.0**）：扫描标定后球内 ≈0.33（可见）、
+   球外 ≈0.73（不过曝），见 `sweep_scatter.py`
+
+另加**深度纹理无效防御**：`SAMPLE_DEPTH_TEXTURE` 返回 0 时（深度纹理未就绪）
+`LinearEyeDepth(0)=0` 会把积分终点钳成 0、整片散射消失；现对 `depth<=1e-5`
+返回极大值（不遮挡）。`AtmosphereGlow.Update` 也每帧兜底确认 `Camera.main` 的
+`DepthTextureMode.Depth` 已设置，避免 Start 时序问题。
+
+修正后离屏对比图：球内天空区 `B-R=124.4`（明显散射蓝色），地表帧方差 4504
+（地表结构仍在），球外/球内 99.8% 像素差异。
+
+### 23.3 地表巡回模式
+
+新增 `Assets/Scripts/SurfaceRover.cs`，`CameraController` 加 `SetExternalControl(bool)`
+（`LateUpdate` 在外部接管时不再写 Transform，两套相机逻辑不打架）。
+
+- **高度口径（实测修正）**：相机到球心距离必须 **`> 星球表面半径`** 且 **`< 大气外壳半径`**。
+  首版用了 `0.985R`（星球网格内部），地表 shader 是 `Cull Back`，相机在球内看到的
+  全是三角形背面 → 整片剔除，表现为「直接跳进星球内部、无法在地表观察」。
+  改为默认 `1.03R`（地表上方 3% 半径、大气外壳 1.16R 之内），滚轮范围 `1.005~1.15R`
+- **near clip（实测修正）**：相机贴地表时离脚下仅 `0.03R ≈ 0.06` 世界单位，而主相机
+  `nearClipPlane = 0.3` 会把脚下地表整个裁掉。巡回模式临时把 near clip 设为
+  `min(原值, 0.02)`，退出时恢复（`OnDestroy` 也兜底恢复）
+- 半径用 `EarthManager.PlanetSurfaceRadius`（自身网格 bounds × lossyScale，与
+  `AtmosphereGlow`/`CloudLayer` 一致），避免 `Renderer.bounds` 被子物体影响而偏大
+- 视线默认朝北、略抬头 2°，让地平线附近的天空与地表都入画
+- 操作：`W/S` 前进后退、`A/D` 平移（沿球面经纬度）、右键拖拽转视线、滚轮调高度、`Shift` 加速
+- 局部基：球面法线 `up`、东 `E = cross(worldUp, up)`、北 `N = cross(up, E)`，极点处退化保护
+- `EarthManager` 新增 `PlanetCenter` / `PlanetSurfaceRadius` 属性供定位
+- UI：right-bar 加「地表巡回 / 退出巡回」按钮，首次点击在主相机上 `AddComponent<SurfaceRover>()`（不改场景文件）
+- 退出：`SetExternalControl(false)`，环绕相机自动恢复
+
+### 23.4 对比图（球外 / 地表巡回）
+
+一次性 `RenderCompare`（用完删）在有 GPU 的 batchmode 下手动建大气球壳
+（离屏场景不触发 `Awake/Start`，运行时球壳不存在），从地球网格 bounds 算真实半径
+（本次 `inner=2.0 / outer=2.32`），渲染两帧：
+
+- `outside.png`：相机在球外远处（near clip 保持 0.3）
+- `inside.png`：相机在地表之上 `1.03R`、大气层内，near clip 临时设 0.02，抬头看地平线
+- `compare.png`：左球外 / 右地表巡回
+
+像素校验（`check_atmo_compare.py`）：100% 像素差异，球外 `B-R=50.0`、
+地表巡回 `B-R=69.9`（大气层内更蓝），且地表帧像素方差 1494（**确实看得到地表结构**，
+不是一片纯色天空）——确认散射在内外不同、且巡回模式能正常观察地表。
+
+### 23.5 验证
+
+| 项 | 结果 |
+|---|---|
+| gate / icecheck 编译 | 0 错误 |
+| 11 个 dump SHA-256 | 与 §3.1 基线逐位一致（生成语义未变） |
+| Unity `CheckCompile` + 完整 Build | `COMPILE_OK` / `BUILD_OK`，shader 变体无 error |
+| 对比图 | 球外/地表巡回 99.8% 差异，球内天空 B-R=124.4（散射可见）、地表帧含可见地表结构，见 `dist/V3.4.0_atmosphere_compare.png` |
+| 散射标定数值复算 | `diag_scatter.py` / `sweep_scatter.py`，球内由 0.02 提升到 0.33 |
+| 视觉回归（散射浓淡 / 巡回手感 / 深度遮挡） | **仍需用户实测** |
+
+---
+
 ## 附：不当作基线的历史数值
 
 以下数值出现在早期记录里，因为算法改动而**不再有效**，列出仅供追溯：
