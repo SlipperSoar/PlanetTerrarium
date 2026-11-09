@@ -40,10 +40,17 @@ public class WorldTerrainGenerator : MonoBehaviour
     /// <summary>本次生成使用的整型配方（写进 _meta.json，用于日后重建）。</summary>
     private MapRecipe pendingRecipe;
 
-    /// <summary>最近一次生成的上下文/配方/名字：用于「导出」与前后切换的缓存。</summary>
-    private TerrainContext lastContext;
-    private MapRecipe lastRecipe;
+    /// <summary>
+    /// 分档上下文缓存（V3.5）：≤2048 两张、≥4096 不缓存。
+    /// 只服务于「按配方重建时命中免重建」，不负责「导出当前地图」。
+    /// </summary>
+    private readonly MapContextCache contextCache = new MapContextCache();
+
+    /// <summary>最近一次生成/载入的地图名（UI 显示、导出命名用）。</summary>
     private string lastBaseName;
+
+    /// <summary>最近一次生成/载入的配方（导出时若无缓存上下文，据此按需重建）。</summary>
+    private MapRecipe lastRecipe;
 
     /// <summary>按配方重建时沿用原来的地图名（null = 新生成，用时间戳命名）。</summary>
     private string pendingBaseName;
@@ -161,10 +168,10 @@ public class WorldTerrainGenerator : MonoBehaviour
     /// <summary>
     /// 命中缓存时直接复用上次的上下文：重新渲染显示贴图（约 1~3 秒），
     /// 不必重跑整条生成管线（8192 档约 32 秒）。
+    /// <paramref name="ctx"/> 由调用方从 <see cref="contextCache"/> 取出。
     /// </summary>
-    private void ApplyCachedToEarth(string baseName)
+    private void ApplyCachedToEarth(TerrainContext ctx, string baseName)
     {
-        TerrainContext ctx = lastContext;
         if (ctx == null || EarthManager.Instance == null)
             return;
 
@@ -218,10 +225,14 @@ public class WorldTerrainGenerator : MonoBehaviour
             return false;
         }
 
-        // 缓存命中：同一份配方且上下文还在，直接复用，不必重算
-        if (lastContext != null && lastRecipe.SameAs(recipe))
+        // 缓存命中：同一份配方且上下文还在（仅 ≤2048 有缓存），直接复用，不必重算。
+        // ≥4096 的配方不会进缓存，这里必然 miss，走完整重建 —— 结果逐位一致，只是慢。
+        MapContextCache.Entry hit = contextCache.Find(recipe);
+        if (hit != null && hit.context != null)
         {
-            ApplyCachedToEarth(baseName);
+            contextCache.Rename(recipe, baseName);
+            lastRecipe = recipe;
+            ApplyCachedToEarth(hit.context, baseName);
             return true;
         }
 
@@ -232,19 +243,61 @@ public class WorldTerrainGenerator : MonoBehaviour
     }
 
     /// <summary>
-    /// 把**当前地图**导出成整包（地形/高度/板块 PNG + 人文 JSON + meta）。
+    /// 把**当前地图**导出成整包（地形/高度/板块 PNG + 数据图 + 人文 JSON + meta）。
     /// 只有用户显式点「导出」时才调用 —— 生成本身不写这些大文件。
+    ///
+    /// 上下文来源（V3.5 分档缓存）：
+    ///   1. 缓存里命中当前配方（≤2048 通常有）→ 直接用
+    ///   2. 未命中（≥4096 不缓存）→ 用 <c>lastRecipe</c> **按需重建一份临时上下文**，
+    ///      导出完立即释放，不进缓存、不常驻。这是同步生成，大分辨率会明显卡顿，
+    ///      但只在用户显式点导出时发生，且日志会说明。
     /// </summary>
     public bool ExportCurrentMap(MapExportOptions? options = null)
     {
-        if (lastContext == null || string.IsNullOrEmpty(lastBaseName))
+        if (string.IsNullOrEmpty(lastBaseName))
         {
-            Debug.LogWarning("ExportCurrentMap: 当前地图没有可导出的生成结果（请先生成或按配方重建）");
+            Debug.LogWarning("ExportCurrentMap: 当前没有地图（请先生成或按配方重建）");
             return false;
         }
 
         MapExportOptions opts = options ?? MapExportOptions.All;
-        bool ok = MapPublisher.ExportFull(lastContext, lastRecipe, lastBaseName, opts);
+
+        // 1. 先找缓存
+        TerrainContext ctx = null;
+        MapContextCache.Entry hit = contextCache.Find(lastRecipe);
+        if (hit != null)
+            ctx = hit.context;
+
+        // 2. 没有缓存上下文 → 按需重建（不进缓存）
+        bool temporary = false;
+        if (ctx == null && lastRecipe.version > 0)
+        {
+            Debug.Log($"ExportCurrentMap: {lastRecipe.width} 档未缓存上下文，按配方即时重建供导出（不进缓存）");
+            ctx = TerrainGenerator.GenerateContext(lastRecipe.ToConfig());
+            temporary = true;
+        }
+
+        if (ctx == null)
+        {
+            Debug.LogWarning("ExportCurrentMap: 当前地图没有配方，也没有可导出的生成结果");
+            return false;
+        }
+
+        bool ok;
+        try
+        {
+            ok = MapPublisher.ExportFull(ctx, lastRecipe, lastBaseName, opts);
+        }
+        finally
+        {
+            if (temporary)
+            {
+                // 临时上下文用完即弃；顺带压一次托管堆，避免大数组滞留
+                ctx = null;
+                GenerationPipeline.CollectNow();
+            }
+        }
+
         Debug.Log(ok
             ? $"已导出地图 {lastBaseName}"
             : $"导出失败 {lastBaseName}");
@@ -252,8 +305,8 @@ public class WorldTerrainGenerator : MonoBehaviour
     }
 
     /// <summary>
-    /// 查看器载入了一张**已有的 PNG 快照**时调用：让「当前地图」与导出状态保持一致。
-    /// 这类地图的 PNG 本来就在磁盘上，没有生成上下文可导出，因此清掉 lastContext，
+    /// 查看器载入了一张**已有的 PNG 快照 / 导入的单张图**时调用：让「当前地图」与
+    /// 导出状态保持一致。这类地图没有生成上下文，因此清空缓存并把配方置空，
     /// 使 ExportCurrentMap 明确拒绝（而不是悄悄导出上一次生成的那张图）。
     /// </summary>
     public void NotifyExternalMapSelected(string baseName)
@@ -261,19 +314,20 @@ public class WorldTerrainGenerator : MonoBehaviour
         if (isGenerating)
             return;
 
-        lastContext = null;
+        contextCache.Clear();
         lastBaseName = baseName;
         lastRecipe = default;
+        generationContext = null;
     }
 
     /// <summary>
-    /// 主动释放常驻的生成上下文（8192 档的逐格数组有数百 MB）。
+    /// 主动释放所有缓存的生成上下文（大分辨率逐格数组有数百 MB）。
     /// 释放后缓存命中失效，再选中同一配方会重新跑管线 —— 结果不变，只是慢一些。
     /// 保留 lastBaseName / lastRecipe，导出与界面显示仍以当前地图为准。
     /// </summary>
     public void ReleaseCachedContext()
     {
-        lastContext = null;
+        contextCache.Clear();
         generationContext = null;
     }
 
@@ -350,8 +404,7 @@ public class WorldTerrainGenerator : MonoBehaviour
 
         // 生成**不落 PNG**：只建显示用的贴图，配方写进 meta。
         // 真正导出由用户点「导出」时触发（ExportCurrentMap），见 MapPublisher。
-        // 注意：这里保留 lastContext 是为了「随时可导出」与配方缓存命中，
-        // 代价是逐格大数组常驻到下次生成/手动释放为止（见 ReleaseCachedContext）。
+        // 上下文按分档策略进缓存（≤2048 两槽 / ≥4096 不缓存），见 contextCache.Put。
         Texture2D terrainTex = ExportLayer(ctx, MapLayer.Terrain, null);
         Texture2D heightTex = ExportOptions.height
             ? ExportLayer(ctx, MapLayer.Height, null)
@@ -377,9 +430,11 @@ public class WorldTerrainGenerator : MonoBehaviour
 
         // 只存配方（几百字节），不写 PNG / human。写失败要如实报错：
         // 否则地图列表里不会出现这张图，界面却已经显示「生成完成」。
-        lastContext = ctx;
+        // 分档缓存：≤2048 进 2 槽 LRU；≥4096 不缓存（Put 内部会 Clear 且不放入）。
+        bool cached = contextCache.Put(recipe, ctx, baseName);
         lastRecipe = recipe;
         lastBaseName = baseName;
+        Debug.Log($"[cache] 生成完成 {recipe.width} 档：{(cached ? $"已缓存（当前 {contextCache.Count} 槽）" : "按策略不缓存上下文")}");
         if (!MapPublisher.SaveRecipe(ctx, recipe, baseName))
         {
             string error = $"写入地图配方失败（{baseName}），该地图无法在列表中重建";
@@ -423,9 +478,9 @@ public class WorldTerrainGenerator : MonoBehaviour
 
         // ── 释放后台线程交出来的中间结果引用 ──
         //
-        // 注意：lastContext 仍持有整份上下文（为了随时可导出 / 缓存命中），
-        // 这里清掉的只是 generationContext 这个「线程→主线程」的交接引用。
-        // 真正释放大数组要调用 ReleaseCachedContext() 或等下一次生成覆盖。
+        // 这里清掉的只是 generationContext 这个「线程→主线程」的交接引用；
+        // 是否保留上下文由 contextCache 按分辨率档位决定（≤2048 两槽 / ≥4096 不保留）。
+        // 大分辨率不被缓存时，这份上下文在方法结束后即可被 GC 回收。
         ReleaseGenerationResult();
 
         // ── 让 Unity 回收「已销毁但尚未真正释放」的原生资源 ──

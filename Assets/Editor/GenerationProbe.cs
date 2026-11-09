@@ -72,6 +72,7 @@ public static class GenerationProbe
                       $"峰值托管 {MB(Math.Max(peak, exportPeak))}");
             VerifyPublishFlow();
             VerifyRecipeDeterminism();
+            VerifyCachePolicy();
 
             Debug.Log("PROBE_OK");
             EditorApplication.Exit(0);
@@ -223,6 +224,29 @@ public static class GenerationProbe
             }
 
             Debug.Log($"[probe] 配方重建逐位一致={same}（首个差异格 {(firstDiff < 0 ? "无" : firstDiff.ToString())}）");
+        }
+
+        /// <summary>V3.5 分档缓存策略：≤2048 双槽 / ≥4096 零槽，以及 0 槽不动已有缓存。</summary>
+        static void VerifyCachePolicy()
+        {
+            bool slotsOk = MapContextCache.SlotsFor(1024) == 2 &&
+                           MapContextCache.SlotsFor(2048) == 2 &&
+                           MapContextCache.SlotsFor(4096) == 0 &&
+                           MapContextCache.SlotsFor(8192) == 0;
+
+            var cache = new MapContextCache();
+            var rA = MapRecipe.FromParameters(1, 1024, 0.6f, 23.44f, 6371f, false);
+            var rBig = MapRecipe.FromParameters(2, 4096, 0.6f, 23.44f, 6371f, false);
+            var ctxA = new TerrainContext(new WorldGenConfig { seed = 1, width = 1024, height = 512 });
+            var ctxBig = new TerrainContext(new WorldGenConfig { seed = 2, width = 4096, height = 2048 });
+
+            bool putA = cache.Put(rA, ctxA, "a");
+            int countAfterA = cache.Count;
+            bool putBig = cache.Put(rBig, ctxBig, "big");   // 应返回 false 且不清空 A
+            bool preserved = cache.Count == countAfterA && cache.Find(rA) != null;
+
+            Debug.Log($"[probe] 分档缓存：档位正确={slotsOk} 1024放入={putA} " +
+                      $"4096放入={putBig}(应false) 已有缓存保留={preserved}");
         }
 
         static string MB(long bytes) => $"{bytes / 1024.0 / 1024.0:F0} MB";

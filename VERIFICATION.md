@@ -1879,6 +1879,68 @@ Properties、两个 pass 的 uniform/helper、ForwardBase frag 里的辉光计�
 
 ---
 
+## 24. V3.5.0：分档上下文缓存 + 配方一致性单测（可选收尾）
+
+### 24.1 背景与决策
+
+交接文档 §3「可选收尾」两项。用户决策：**缓存仅 ≤2k 允许 2 槽、≥4k 不再缓存**，
+原因是两份 8192 上下文各约 800 MB，与 V2.x 好容易压下去的内存峰值直接冲突。
+收尾完成后再打磨渲染。
+
+### 24.2 分档缓存（`MapContextCache.cs`）
+
+| 宽度档位 | 槽位 | 行为 |
+|---|---|---|
+| `1024 / 2048` | **2 槽 LRU** | A→B→A 切图免重建；两份小上下文（2048 各约 100 MB）可接受 |
+| `4096 / 8192` | **0 槽** | 生成后不保留任何上下文；切图重跑管线（结果逐位一致，只是慢） |
+
+`SlotsFor(width)` 先 `MapResolution.Snap` 再判断，非档位值也能正确归类。
+`Put` 对 0 槽**只返回 false、不清空已有缓存**（生成一张 4096 图不该把之前缓存的
+两张 2048 图清掉）。`Find` 命中后移到队尾（LRU），`Rename` 更新命中条目的地图名。
+
+### 24.3 `WorldTerrainGenerator` 重构
+
+- 删除单槽 `lastContext`；新增 `MapContextCache contextCache` 专职缓存
+- 保留 `lastBaseName`（UI 显示）与 `lastRecipe`（当前地图配方）
+- `GenerateFromRecipe` 命中改为 `contextCache.Find(recipe)`；≥4096 必然 miss、走完整重建
+- `ApplyCachedToEarth(ctx, baseName)` 改为接收 ctx 参数
+- `NotifyExternalMapSelected` / `ReleaseCachedContext` 改为 `contextCache.Clear()`
+- **`ExportCurrentMap` 的按需重建**（关键）：≥4096 无缓存上下文时，用 `lastRecipe`
+  `TerrainGenerator.GenerateContext` 即时重建一份**临时上下文**供导出，用完即
+  `ctx=null` + `GenerationPipeline.CollectNow()`，不进缓存、不常驻。
+  这是同步生成、大分辨率点导出会明显卡顿，但只在用户显式触发时发生且日志会说明
+- 生成协程里 `contextCache.Put` 后打一条 `[cache]` 日志，标明该档是否缓存、当前槽数
+
+> 语义说明：「缓存」在本项目专指 `GenerateFromRecipe` 的**命中免重建**。
+> 「导出当前地图」是即时功能，靠按需重建保证，不依赖历史缓存。
+
+### 24.4 配方一致性单测下沉到 `resolutioncheck`
+
+`ResolutionCheck.cs` 新增两组测试（离线校验台，不开 Unity 即可跑）：
+- `TestCachePolicy`：档位槽位（含吸附后的 1500/3000/7000）、LRU 淘汰、重复 Put
+  不重复、0 槽不动已有缓存、Rename、Clear
+- `TestRecipeDeterminism`：同一配方两次 `GenerateContext` 的高度场用
+  `BitConverter.SingleToInt32Bits` 逐位比较（原仅由 `GenerationProbe` 覆盖，现下沉）
+
+`stepcheck.csproj` / `rescheck.csproj` 都补了 `MapContextCache.cs` 的 Compile 引用
+（`ResolutionCheck.cs` 被两个工程共用）。`GenerationProbe` 也加了 `VerifyCachePolicy`
+在 Unity 侧复核分档策略。
+
+### 24.5 验证
+
+| 项 | 结果 |
+|---|---|
+| gate / icecheck 编译 | 0 错误 |
+| 11 个 dump SHA-256 | 与 §3.1 基线逐位一致（生成语义未变） |
+| stepcheck / resolutioncheck / biomecheck / planetcheck | 全部通过（含新增缓存 + 配方一致性断言） |
+| 外部解码工具 | 全部通过 |
+| Unity `CheckCompile` | `COMPILE_OK`，0 CS 错误 |
+| `GenerationProbe` | `PROBE_OK`，新增「分档缓存：档位正确 / 4096放入=false / 已有缓存保留」 |
+| Windows Build | `BUILD_OK` |
+| 视觉回归（切图速度 / 大图导出卡顿 / 内存） | **仍需用户实测** |
+
+---
+
 ## 附：不当作基线的历史数值
 
 以下数值出现在早期记录里，因为算法改动而**不再有效**，列出仅供追溯：
